@@ -26,8 +26,29 @@ export async function handleAdminRequest(request, env, url, isAdmin) {
     if (action === "delete" && request.method === "DELETE") {
       const deleteKey = decodeURIComponent(url.pathname.replace("/_admin/api/delete/", ""));
       await env.BUCKET.delete(deleteKey);
+      await env.file_share_db.prepare("UPDATE files SET status = 'deleted' WHERE file_key = ?").bind(deleteKey).run();
       logEvent(env, { action: "DELETE", key: deleteKey, email: userEmail });
       return new Response("Deleted");
+    }
+
+    // New: Invalidate API (Force Expire/Soft Delete)
+    if (action === "invalidate" && request.method === "POST") {
+      const key = url.searchParams.get("key");
+      if (!key) return new Response("Key required", { status: 400 });
+      
+      const newSalt = Date.now().toString();
+      const deleteBuffer = Math.floor(Date.now() / 1000) + 600; // 10 min buffer
+      
+      await env.file_share_db.prepare(`
+        UPDATE files 
+        SET status = 'pending_delete', 
+            version_salt = ?, 
+            delete_after = ?
+        WHERE file_key = ?
+      `).bind(newSalt, deleteBuffer, key).run();
+
+      logEvent(env, { action: "INVALIDATE", key, email: userEmail });
+      return new Response("Invalidated");
     }
 
     // New: Signature API (for Copy Link)
@@ -41,15 +62,20 @@ export async function handleAdminRequest(request, env, url, isAdmin) {
       const now = Math.floor(Date.now() / 1000);
       const maxExp = now + (30 * 24 * 60 * 60); // 30 days cap
       
-      // Default expiration: 24 hours, max: 30 days
-      let exp = requestedExp || (now + 24 * 60 * 60);
-      if (exp > maxExp) exp = maxExp;
+      // 1. Fetch metadata from D1 (Authoritative)
+      const file = await env.file_share_db.prepare(
+        "SELECT version_salt, status, expire_at FROM files WHERE file_key = ?"
+      ).bind(key).first();
 
-      // Fetch revocation salt from metadata
-      const head = await env.BUCKET.head(key);
-      const salt = head?.customMetadata?.v || "";
+      if (!file || file.status !== 'active') {
+        return new Response("Forbidden: File is inactive or expired", { status: 403 });
+      }
+
+      // 2. Expiration logic
+      let exp = requestedExp || file.expire_at;
+      if (exp > maxExp) exp = maxExp;
       
-      const signature = await sign(key, exp, env.AUTH_SECRET || env.GET_SIGNATURE, kid, salt, ot);
+      const signature = await sign(key, exp, env.AUTH_SECRET || env.GET_SIGNATURE, kid, file.version_salt, ot);
       
       logEvent(env, { action: "SIGN", key, email: userEmail });
       
@@ -125,7 +151,20 @@ async function handleMultipartUpload(request, env, url, userEmail) {
         return new Response(`Quota Exceeded: Total storage limit is ${TOTAL_QUOTA_GB}GB. Currently used: ${(totalUsed / 1024 / 1024 / 1024).toFixed(2)}GB.`, { status: 403 });
       }
 
-      const upload = await env.BUCKET.createMultipartUpload(fileKey);
+      // 3. Initialize Metadata for D1 consistency
+      const now = Math.floor(Date.now() / 1000);
+      const salt = Date.now().toString();
+      const exp = now + 24 * 60 * 60; // Default 24h
+      const maxDownloads = url.searchParams.get("max") || "999999";
+
+      const upload = await env.BUCKET.createMultipartUpload(fileKey, {
+        customMetadata: {
+          v: salt,
+          e: exp.toString(),
+          m: maxDownloads, 
+          ot: "0"      
+        }
+      });
       logEvent(env, { action: "UPLOAD_START", key: fileKey, email: userEmail, size: fileSize });
       return Response.json({ uploadId: upload.uploadId });
     }
@@ -160,6 +199,32 @@ async function handleMultipartUpload(request, env, url, userEmail) {
       }
 
       await upload.complete(parts);
+      
+      // 2. NEW: Authoritative D1 Write after successful R2 completion
+      const head = await env.BUCKET.head(fileKey);
+      if (head) {
+        const now = Math.floor(Date.now() / 1000);
+        const salt = head.customMetadata?.v || Date.now().toString();
+        const exp = parseInt(head.customMetadata?.e || (now + 24 * 60 * 60).toString());
+        const max_dl = parseInt(head.customMetadata?.m || "999999");
+        const ot = parseInt(head.customMetadata?.ot || "0");
+        
+        await env.file_share_db.prepare(`
+          INSERT INTO files (file_key, original_name, expire_at, max_downloads, download_count, version_salt, is_one_time, status, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(file_key) DO UPDATE SET
+            original_name = excluded.original_name,
+            expire_at = excluded.expire_at,
+            max_downloads = excluded.max_downloads,
+            download_count = 0,
+            version_salt = excluded.version_salt,
+            is_one_time = excluded.is_one_time,
+            status = 'active',
+            created_at = excluded.created_at,
+            delete_after = NULL
+        `).bind(fileKey, fileKey, exp, max_dl, 0, salt, ot, 'active', now).run();
+      }
+
       logEvent(env, { action: "UPLOAD_COMPLETE", key: fileKey, email: userEmail });
       return new Response("OK");
     }
@@ -167,27 +232,41 @@ async function handleMultipartUpload(request, env, url, userEmail) {
 }
 
 async function renderDashboard(env) {
-  const list = await env.BUCKET.list();
+  const { results: d1Files } = await env.file_share_db.prepare(
+    "SELECT * FROM files WHERE status != 'deleted' ORDER BY created_at DESC"
+  ).all();
+
+  const now = Math.floor(Date.now() / 1000);
   
-  const FREE_LIMIT = 10 * 1024 * 1024 * 1024; // 10GB
-  let totalUsed = 0;
-  
-  const files = list.objects.map(o => {
-    totalUsed += o.size;
+  const files = d1Files.map(o => {
+    const remains = o.expire_at - now;
+    const remainsText = remains > 0 
+      ? `${(remains / 3600).toFixed(1)}h` 
+      : '<span style="color:red">Expired</span>';
+      
+    const statusColor = o.status === 'active' ? '#28a745' : '#ffc107';
+    const isInactive = o.status !== 'active';
+
     return `
     <tr>
-      <td>${o.key}</td>
-      <td>${(o.size / 1024 / 1024).toFixed(2)} MB</td>
-      <td>${new Date(o.uploaded).toLocaleString()}</td>
+      <td>${o.file_key}</td>
+      <td>${o.download_count} / ${o.max_downloads >= 999999 ? '∞' : o.max_downloads}</td>
+      <td>${remainsText}</td>
+      <td><span style="background:${statusColor}; color:white; padding:2px 6px; border-radius:4px; font-size:0.85em">${o.status}</span></td>
       <td>
-        <button onclick="deleteFile('${o.key}')" style="color:red">Delete</button>
-        <button onclick="revokeFile('${o.key}')" style="color:orange">Revoke Links</button>
-        <button onclick="copyLink('${o.key}')">Copy Link</button>
-        <button onclick="copyLink('${o.key}', true)" style="border-style:dashed">One-Time Link</button>
+        <button onclick="deleteFile('${o.file_key}')" style="color:red" title="Physical Delete">Delete</button>
+        <button onclick="invalidateFile('${o.file_key}')" style="color:orange" ${isInactive ? 'disabled' : ''} title="Revoke and mark for deletion">Invalidate</button>
+        <button onclick="copyLink('${o.file_key}')" ${isInactive ? 'disabled' : ''}>Copy</button>
+        <button onclick="copyLink('${o.file_key}', true)" style="border-style:dashed" ${isInactive ? 'disabled' : ''}>One-Time</button>
       </td>
     </tr>
     `;
   }).join("");
+
+  const list = await env.BUCKET.list();
+  const FREE_LIMIT = 10 * 1024 * 1024 * 1024; // 10GB
+  let totalUsed = 0;
+  list.objects.forEach(o => totalUsed += o.size);
 
   const usedPercent = ((totalUsed / FREE_LIMIT) * 100).toFixed(2);
   const remainingGB = ((FREE_LIMIT - totalUsed) / 1024 / 1024 / 1024).toFixed(2);
@@ -197,28 +276,30 @@ async function renderDashboard(env) {
   <html lang="zh-CN">
   <head>
     <meta charset="UTF-8">
-    <title>R2 Admin</title>
+    <title>R2 Admin (D1 Enhanced)</title>
     <link rel="icon" type="image/png" href="/favicon.png">
     <style>
-      body { font-family: sans-serif; padding: 20px; max-width: 900px; margin: 0 auto; line-height: 1.6; background: #f4f7f9; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; max-width: 1000px; margin: 0 auto; line-height: 1.6; background: #f4f7f9; }
       .card { background: #fff; border: 1px solid #ddd; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-      table { width: 100%; border-collapse: collapse; }
-      th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
+      table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+      th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; font-size: 0.95em; }
+      th { background: #f8f9fa; color: #666; font-weight: 600; }
       .progress-container { height: 12px; background: #eee; border-radius: 6px; overflow: hidden; margin: 10px 0; }
       .progress-fill { height: 100%; background: #007bff; transition: width 0.3s; }
-      .usage-info { display: flex; justify-content: space-between; font-size: 0.9em; color: #555; }
+      .usage-info { display: flex; justify-content: space-between; font-size: 0.85em; color: #666; }
       .upload-progress { height: 20px; background: #eee; border-radius: 10px; display: none; margin: 10px 0; overflow: hidden; }
       .upload-bar { height: 100%; background: #28a745; width: 0%; transition: width 0.3s; }
-      button { padding: 6px 12px; cursor: pointer; border: 1px solid #ddd; border-radius: 4px; background: #fff; }
-      button:hover { background: #f0f0f0; }
-      h1 { color: #333; }
+      button { padding: 5px 10px; cursor: pointer; border: 1px solid #ddd; border-radius: 4px; background: #fff; font-size: 0.9em; transition: 0.2s; }
+      button:hover:not(:disabled) { background: #f0f0f0; border-color: #ccc; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      h1 { color: #333; margin-bottom: 30px; }
     </style>
   </head>
   <body>
-    <h1>R2 Manager</h1>
+    <h1>R2/D1 File Manager</h1>
     
     <div class="card">
-      <h3 style="margin-top:0">R2 Storage Usage (Free Tier: 10GB)</h3>
+      <h3 style="margin-top:0">Storage Usage (Free Tier: 10GB)</h3>
       <div class="progress-container">
         <div class="progress-fill" style="width: ${usedPercent}%"></div>
       </div>
@@ -229,16 +310,23 @@ async function renderDashboard(env) {
     </div>
 
     <div class="card">
-      <h3>Upload File (Max 5GB)</h3>
-      <input type="file" id="fileInput">
-      <button onclick="startUpload()" style="background: #28a745; color: white; border: none;">Upload</button>
+      <h3 style="margin-top:0">Upload File (Max 5GB)</h3>
+      <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
+        <input type="file" id="fileInput" style="flex: 1">
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <label style="font-size: 0.75em; color: #666;">Max Downloads</label>
+          <input type="number" id="maxDownloads" value="999999" style="width: 80px; padding: 4px;">
+        </div>
+        <button onclick="startUpload()" style="background: #28a745; color: white; border: none; padding: 8px 16px; align-self: flex-end;">Upload</button>
+      </div>
       <div class="upload-progress" id="pBox"><div class="upload-bar" id="pBar"></div></div>
-      <p id="status" style="color: #666;"></p>
+      <p id="status" style="color: #666; font-size: 0.9em;"></p>
     </div>
 
     <div class="card">
+      <h3 style="margin-top:0">Active Files</h3>
       <table>
-        <thead><tr><th>Name</th><th>Size</th><th>Date</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Key</th><th>DL Count</th><th>Expires</th><th>Status</th><th>Actions</th></tr></thead>
         <tbody>${files}</tbody>
       </table>
     </div>
@@ -249,18 +337,16 @@ async function renderDashboard(env) {
       async function startUpload() {
         const file = document.getElementById('fileInput').files[0];
         if (!file) return;
-        if (file.size > 5 * 1024 * 1024 * 1024) return alert('File too large (Max 5GB)');
-
         const status = document.getElementById('status');
         const pBox = document.getElementById('pBox');
         const pBar = document.getElementById('pBar');
-        
         status.innerText = 'Initializing...';
         pBox.style.display = 'block';
 
         let uploadId = null;
         try {
-          const startRes = await fetch('/_admin/api/multipart/start?key=' + encodeURIComponent(file.name) + '&size=' + file.size);
+          const maxDl = document.getElementById('maxDownloads').value;
+          const startRes = await fetch('/_admin/api/multipart/start?key=' + encodeURIComponent(file.name) + '&size=' + file.size + '&max=' + maxDl);
           const startData = await startRes.json();
           uploadId = startData.uploadId;
 
@@ -272,49 +358,39 @@ async function renderDashboard(env) {
             const end = Math.min(file.size, start + CHUNK_SIZE);
             const chunk = file.slice(start, end);
             const partNumber = i + 1;
-            status.innerText = 'Uploading part ' + partNumber + '/' + totalChunks + '...';
+            status.innerText = 'Uploading: ' + Math.round((i/totalChunks)*100) + '%';
             const upRes = await fetch('/_admin/api/multipart/upload?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId + '&partNumber=' + partNumber, {
               method: 'PUT',
               body: chunk
             });
-            if (!upRes.ok) throw new Error('Failed to upload part ' + partNumber);
             const partData = await upRes.json();
             uploadedParts.push(partData);
             pBar.style.width = Math.round((partNumber / totalChunks) * 100) + '%';
           }
 
           status.innerText = 'Finalizing...';
-          const completeRes = await fetch('/_admin/api/multipart/complete?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId, {
+          await fetch('/_admin/api/multipart/complete?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId, {
             method: 'POST',
             body: JSON.stringify(uploadedParts)
           });
-          if (!completeRes.ok) throw new Error('Failed to complete upload');
-
-          alert('Upload Complete!');
           location.reload();
         } catch (e) {
-          console.error(e);
-          status.innerText = 'Error: ' + e.message;
-          if (uploadId) {
-            status.innerText += ' (Aborting upload...)';
-            await fetch('/_admin/api/multipart/abort?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId, { method: 'DELETE' });
-            status.innerText += ' Done.';
-          }
           alert('Upload failed: ' + e.message);
+          if (uploadId) fetch('/_admin/api/multipart/abort?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId, { method: 'DELETE' });
         }
       }
 
       async function deleteFile(k) {
-        if(confirm('Delete?')) {
+        if(confirm('Permanently delete from R2 and D1?')) {
           await fetch('/_admin/api/delete/' + encodeURIComponent(k), { method: 'DELETE' });
           location.reload();
         }
       }
 
-      async function revokeFile(k) {
-        if(confirm('Revoke all current links for this file? All existing shared links will immediately become invalid.')) {
-          await fetch('/_admin/api/revoke?key=' + encodeURIComponent(k), { method: 'POST' });
-          alert('Links revoked!');
+      async function invalidateFile(k) {
+        if(confirm('Immediately invalidate all links and schedule for deletion? (Soft Delete)')) {
+          await fetch('/_admin/api/invalidate?key=' + encodeURIComponent(k), { method: 'POST' });
+          location.reload();
         }
       }
       
@@ -322,11 +398,11 @@ async function renderDashboard(env) {
         try {
           const res = await fetch('/_admin/api/sign?key=' + encodeURIComponent(k) + (isOneTime ? '&ot=1' : ''));
           const data = await res.json();
-          navigator.clipboard.writeText(data.url);
-          alert(isOneTime ? 'One-Time Link copied! (Valid for 24h, invalidates after first access)' : 'Link copied to clipboard! (Valid for 24h)');
-        } catch (e) {
-          alert('Failed to get signed link');
-        }
+          if (data.url) {
+            navigator.clipboard.writeText(data.url);
+            alert('Link copied!');
+          } else { throw new Error('No URL'); }
+        } catch (e) { alert('Error: ' + e.message); }
       }
     </script>
   </body>

@@ -1,6 +1,6 @@
 # Cloudflare R2 Share - 私人文件分享与管理系统
 
-基于 **Cloudflare Workers** 和 **Cloudflare R2** 构建的轻量级、高安全性私人文件存储与分享系统。
+基于 **Cloudflare Workers**、**Cloudflare R2** 和 **Cloudflare D1** 构建的轻量级、高安全性私人文件存储与分享系统。
 
 专为"个人偶尔分享文件"的场景设计。通过高度定制的安全策略（Cloudflare Access + HMAC 动态签名），在彻底杜绝 R2 存储桶被公网恶意刷流量的同时，保留了极简的直连下载体验。
 
@@ -12,7 +12,9 @@
 |------|------|
 | 计算层 | Cloudflare Workers (JavaScript / V8 Isolate) |
 | 存储层 | Cloudflare R2 Object Storage |
+| 元数据层 | Cloudflare D1 (SQLite) |
 | 安全认证 | Cloudflare Access (Zero Trust) 邮箱验证 + HMAC-SHA256 动态签名 |
+| 定时任务 | Cron Trigger（每 30 分钟清理过期文件） |
 | 前端界面 | 原生 HTML5 + CSS3 + Vanilla JS（内置渲染，零外部依赖） |
 
 ---
@@ -21,17 +23,51 @@
 
 1. **动态签名保护：** 每个分享链接均根据文件名、过期时间、文件版本盐值和一次性标记动态生成 HMAC-SHA256 签名，防止横向越权访问。
 2. **链接时效性：** 支持设置链接有效期（默认 24 小时，最长 30 天），过期自动失效。
-3. **一次性链接（One-Time Link）：** 支持生成仅可访问一次的下载链接，首次访问后自动吊销，适合发送敏感文件。
-4. **链接吊销（Revoke）：** 支持一键吊销某个文件的所有已签发链接，通过更新文件元数据中的版本盐值使旧签名立即失效，无需删除文件。
-5. **多密钥轮转支持：** 签名支持 `kid`（Key ID）参数，可在 `AUTH_SECRET` 中以 JSON 形式配置多个密钥，实现平滑密钥轮换。
-6. **大文件分片上传：** 突破 Cloudflare Workers 免费版 100MB 请求体限制，前端使用 40MB 自动切片并发流式上传，单文件最大支持 5GB。
-7. **存储配额管理：** 可配置总存储上限（默认 10GB），上传前自动校验，超限拒绝上传。
-8. **文件类型白名单：** 仅允许上传指定扩展名的文件类型，防止恶意文件上传。
-9. **完美中文支持：** 严格遵循 RFC 5987 标准（`filename*=UTF-8''`），彻底解决下载时中文文件名乱码问题。
-10. **CORS 跨域支持：** 完整处理 `OPTIONS` 预检请求并全局注入 CORS 头，允许从其他域名安全调用 API 或下载资源。
-11. **深度防探测机制：** 统一签名错误与资源不存在时的返回行为（模糊处理），避免攻击者通过响应差异进行文件枚举探测。
-12. **安全响应头：** 自动注入 `X-Robots-Tag: noindex` 防止搜索引擎索引、`X-Content-Type-Options: nosniff` 防止 MIME 嗅探、`Cache-Control: private` 防止共享缓存泄露。
-13. **模块化架构：** 代码结构清晰，将加密校验、Bucket 操作、管理后台、日志记录解耦为独立模块，易于二次开发和维护。
+3. **一次性链接（One-Time Link）：** 支持生成仅可访问一次的下载链接，首次完整下载后自动吊销，适合发送敏感文件。
+4. **下载次数限制：** 上传时可设置最大下载次数，达到上限后链接自动失效。
+5. **链接吊销（Revoke）：** 支持一键吊销某个文件的所有已签发链接，通过更新文件元数据中的版本盐值使旧签名立即失效，无需删除文件。
+6. **链接作废（Invalidate）：** 支持将文件标记为"待删除"状态，立即失效所有链接，并在下次 Cron 触发时自动从 R2 中物理删除。
+7. **多密钥轮转支持：** 签名支持 `kid`（Key ID）参数，可在 `AUTH_SECRET` 中以 JSON 形式配置多个密钥，实现平滑密钥轮换。
+8. **大文件分片上传：** 突破 Cloudflare Workers 免费版 100MB 请求体限制，前端使用 40MB 自动切片并发流式上传，单文件最大支持 5GB。
+9. **存储配额管理：** 可配置总存储上限（默认 10GB），上传前自动校验，超限拒绝上传。
+10. **文件类型白名单：** 仅允许上传指定扩展名的文件类型，防止恶意文件上传。
+11. **完美中文支持：** 严格遵循 RFC 5987 标准（`filename*=UTF-8''`），彻底解决下载时中文文件名乱码问题。
+12. **原子下载计数：** 基于 D1 数据库的 `RETURNING` 子句实现原子化的下载次数递增，精确控制下载限额。
+13. **元数据自愈（Self-Healing）：** 当文件存在于 R2 但 D1 元数据记录缺失时，自动从 R2 的 Custom Metadata 重建 D1 记录，保证系统一致性。
+14. **惰性清理（Lazy Cleanup）：** 访问过期文件时即时删除并返回失效页面，Cron 定时任务做兜底批量清理。
+15. **美观的失效页面：** 链接过期或达到下载上限时，返回友好的中文/双语失效提示页面。
+16. **CORS 跨域支持：** 完整处理 `OPTIONS` 预检请求并全局注入 CORS 头，允许从其他域名安全调用 API 或下载资源。
+17. **深度防探测机制：** 统一签名错误与资源不存在时的返回行为（模糊处理），避免攻击者通过响应差异进行文件枚举探测。
+18. **安全响应头：** 自动注入 `X-Robots-Tag: noindex, nofollow` 防止搜索引擎索引、`X-Content-Type-Options: nosniff` 防止 MIME 嗅探、`Cache-Control: no-store` 强制禁用缓存以确保下载计数准确。
+19. **结构化日志：** 支持 Cloudflare Analytics Engine，所有操作记录结构化日志，邮箱自动脱敏。
+
+---
+
+## D1 数据库
+
+系统使用 Cloudflare D1（基于 SQLite）存储文件元数据，实现精确的下载计数、链接状态追踪和自动清理。
+
+### 建表语句
+
+请在 Cloudflare Dashboard 或通过 Wrangler 执行以下 SQL：
+
+```sql
+CREATE TABLE IF NOT EXISTS files (
+  file_key       TEXT PRIMARY KEY,       -- 文件名（R2 Object Key）
+  original_name  TEXT NOT NULL,           -- 原始文件名
+  expire_at      INTEGER NOT NULL,        -- 过期时间戳（Unix 秒）
+  max_downloads  INTEGER DEFAULT 999999,  -- 最大下载次数
+  download_count INTEGER DEFAULT 0,       -- 当前下载次数
+  version_salt   TEXT NOT NULL,           -- 版本盐值（用于签名和吊销）
+  is_one_time    INTEGER DEFAULT 0,       -- 是否一次性链接
+  status         TEXT DEFAULT 'active',   -- active / pending_delete / deleted / expired
+  created_at     INTEGER NOT NULL,        -- 创建时间戳
+  delete_after   INTEGER                  -- 待删除时间戳（pending_delete 状态用）
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
+CREATE INDEX IF NOT EXISTS idx_files_expire ON files(expire_at);
+```
 
 ---
 
@@ -48,14 +84,31 @@ flowchart TD
 
     Worker --> Route{"路由解析"}
 
-    Route -->|/_admin| AdminModule["src/admin.js<br/>渲染 Dashboard 和管理 API"]
-    Route -->|GET /*| CryptoModule{"src/crypto.js<br/>HMAC 签名校验"}
+    Route -->|/_admin| AdminModule["src/admin.js<br/>Dashboard + 管理 API<br/>+ 分片上传"]
+    Route -->|GET /*| VerifyFlow{"D1 查询文件状态"}
 
-    CryptoModule -->|校验失败 / 过期| 403["403 Forbidden"]
-    CryptoModule -->|校验成功| BucketModule["src/bucket.js<br/>从 R2 读取文件流"]
+    VerifyFlow -->|文件不存在/非活跃| SelfHeal{"R2 自愈检查"}
+    SelfHeal -->|R2 有元数据| Rebuild["重建 D1 记录"]
+    SelfHeal -->|R2 也无| ExpiredPage["返回失效页面"]
+
+    Rebuild --> CryptoModule["src/crypto.js<br/>HMAC 签名校验"]
+    VerifyFlow -->|活跃且未过期| CryptoModule
+
+    CryptoModule -->|校验失败 / 过期| 403["403 Forbidden / 失效页面"]
+    CryptoModule -->|校验成功| CountFlow{"原子下载计数"}
+    
+    CountFlow -->|达上限 / 一次性| AutoRevoke["自动吊销 + 待删除标记"]
+    CountFlow -->|正常| BucketModule["src/bucket.js<br/>从 R2 读取文件流"]
 
     AdminModule --> R2[("R2 Storage Bucket")]
+    AdminModule --> D1[("D1 Database")]
     BucketModule --> R2
+    CountFlow --> D1
+    VerifyFlow --> D1
+
+    subgraph Cron["Cron Trigger (每30分钟)"]
+        Cleanup["查询过期/pending_delete 记录"] --> BatchDelete["批量删除 R2 + D1"]
+    end
 ```
 
 ### 路由说明
@@ -65,7 +118,8 @@ flowchart TD
 | `/_admin` | GET | Cloudflare Access | 管理后台 Dashboard |
 | `/_admin/api/sign` | GET | Cloudflare Access | 生成文件分享签名链接 |
 | `/_admin/api/revoke` | POST | Cloudflare Access | 吊销文件所有已签发链接 |
-| `/_admin/api/delete/*` | DELETE | Cloudflare Access | 删除文件 |
+| `/_admin/api/invalidate` | POST | Cloudflare Access | 作废链接并标记待删除 |
+| `/_admin/api/delete/*` | DELETE | Cloudflare Access | 物理删除文件 |
 | `/_admin/api/multipart/start` | GET | Cloudflare Access | 初始化分片上传 |
 | `/_admin/api/multipart/upload` | PUT | Cloudflare Access | 上传分片 |
 | `/_admin/api/multipart/complete` | POST | Cloudflare Access | 完成分片上传 |
@@ -88,9 +142,9 @@ flowchart TD
 ```
 file-share-worker/
 ├── src/
-│   ├── index.js      # 主入口，路由分发、安全检查、CORS 处理
+│   ├── index.js      # 主入口，路由分发、安全检查、CORS 处理、Cron 定时任务
 │   ├── crypto.js     # HMAC-SHA256 签名生成、校验及恒定时间比较
-│   ├── admin.js      # 管理后台 Dashboard 及所有管理 API
+│   ├── admin.js      # 管理后台 Dashboard、分片上传及所有管理 API
 │   ├── bucket.js     # R2 存储桶操作抽象层（文件读取、Range 支持）
 │   └── logger.js     # 结构化日志及 Analytics Engine 上报
 ├── public/
@@ -112,6 +166,7 @@ file-share-worker/
 - pnpm
 - Cloudflare 账号
 - 已创建 R2 存储桶
+- 已创建 D1 数据库
 
 ### 1. 克隆并安装依赖
 
@@ -119,9 +174,9 @@ file-share-worker/
 pnpm install
 ```
 
-### 2. 配置 R2 存储桶
+### 2. 配置 R2 存储桶与 D1 数据库
 
-编辑 `wrangler.jsonc`，将 `r2_buckets[0].bucket_name` 修改为你的 R2 存储桶名称：
+编辑 `wrangler.jsonc`，将 `r2_buckets[0].bucket_name` 和 `d1_databases[0].database_id` 修改为你的实际值：
 
 ```jsonc
 "r2_buckets": [
@@ -129,10 +184,29 @@ pnpm install
     "binding": "BUCKET",
     "bucket_name": "你的存储桶名称"
   }
+],
+"d1_databases": [
+  {
+    "binding": "file_share_db",
+    "database_name": "file-share-db",
+    "database_id": "你的 D1 数据库 ID"
+  }
 ]
 ```
 
-### 3. 配置密钥
+### 3. 初始化 D1 数据库表
+
+```bash
+npx wrangler d1 execute file-share-db --file=./schema.sql
+```
+
+或者直接执行 SQL：
+
+```bash
+npx wrangler d1 execute file-share-db --command="CREATE TABLE IF NOT EXISTS files (file_key TEXT PRIMARY KEY, original_name TEXT NOT NULL, expire_at INTEGER NOT NULL, max_downloads INTEGER DEFAULT 999999, download_count INTEGER DEFAULT 0, version_salt TEXT NOT NULL, is_one_time INTEGER DEFAULT 0, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, delete_after INTEGER); CREATE INDEX IF NOT EXISTS idx_files_status ON files(status); CREATE INDEX IF NOT EXISTS idx_files_expire ON files(expire_at);"
+```
+
+### 4. 配置密钥
 
 ```bash
 # 设置 HMAC 签名密钥（生产环境必填）
@@ -145,7 +219,7 @@ npx wrangler secret put AUTH_SECRET
 openssl rand -base64 32
 ```
 
-### 4. 配置管理员邮箱
+### 5. 配置管理员邮箱
 
 ```bash
 # 设置管理员邮箱列表，多个邮箱用逗号分隔
@@ -154,13 +228,13 @@ npx wrangler secret put ADMIN_EMAILS
 
 输入格式：`admin@example.com,admin2@example.com`
 
-### 5. 本地开发
+### 6. 本地开发
 
 ```bash
 pnpm run dev
 ```
 
-### 6. 部署
+### 7. 部署
 
 ```bash
 pnpm run deploy
@@ -176,7 +250,6 @@ pnpm run deploy
 | `ADMIN_EMAILS` | Secret | 是 | - | 管理员邮箱列表，支持多个邮箱用逗号分隔（如 `a@b.com,c@d.com`） |
 | `GET_SIGNATURE` | Secret | 否 | - | 兼容旧版，若未设置 `AUTH_SECRET` 则回退使用此变量 |
 | `TOTAL_QUOTA_GB` | Var | 否 | `10` | 存储总配额（GB），超出后拒绝上传 |
-| `ALLOW_DIRECT_ACCESS` | Var | 否 | `false` | 是否允许通过 `.workers.dev` 域名直接访问（生产环境已强制禁止，无需此变量） |
 
 ---
 
@@ -225,8 +298,9 @@ npx wrangler secret put ADMIN_EMAILS
 - 签名校验采用恒定时间比较，防止时序攻击
 - 签名错误与资源不存在统一返回 403，防止信息泄露
 - 生产环境自动阻止 `.workers.dev` 域名直接访问
-- **防索引保护**：自动注入 `X-Robots-Tag: noindex` 响应头，防止搜索引擎抓取已签发的链接。
-- **缓存控制**：强制 `Cache-Control: private`，防止共享 CDN 缓存私有签名内容。
+- **防索引保护**：自动注入 `X-Robots-Tag: noindex, nofollow` 响应头，防止搜索引擎抓取已签发的链接
+- **缓存控制**：强制 `Cache-Control: no-store, no-cache, must-revalidate`，确保每次下载都经过计数校验
+- **失效页面**：链接过期或达上限时展示友好的中文/双语提示页面，不暴露任何技术细节
 
 ---
 
@@ -279,6 +353,9 @@ pnpm run test
 
 # 部署到 Cloudflare
 pnpm run deploy
+
+# 生成 TypeScript 类型（修改 wrangler.jsonc 后执行）
+npx wrangler types
 ```
 
 ---
@@ -319,7 +396,15 @@ GET /_admin/api/sign?key={文件名}&exp={过期时间戳}&k={密钥ID}&ot={是�
 POST /_admin/api/revoke?key={文件名}
 ```
 
-使指定文件的所有已签发链接立即失效。
+使指定文件的所有已签发链接立即失效。通过更新 R2 文件的 Custom Metadata 版本盐值实现，无需删除文件。
+
+### 作废链接
+
+```
+POST /_admin/api/invalidate?key={文件名}
+```
+
+将文件标记为 `pending_delete` 状态，立即失效所有链接，更新版本盐值，并设置 10 分钟后由 Cron 任务执行物理删除。
 
 ### 删除文件
 
@@ -327,9 +412,11 @@ POST /_admin/api/revoke?key={文件名}
 DELETE /_admin/api/delete/{文件名}
 ```
 
+直接从 R2 和 D1 中物理删除文件。
+
 ### 分片上传流程
 
-1. **初始化上传：** `GET /_admin/api/multipart/start?key={文件名}&size={文件大小}`
+1. **初始化上传：** `GET /_admin/api/multipart/start?key={文件名}&size={文件大小}&max={最大下载次数}`
 2. **上传分片：** `PUT /_admin/api/multipart/upload?key={文件名}&uploadId={ID}&partNumber={N}`
 3. **完成上传：** `POST /_admin/api/multipart/complete?key={文件名}&uploadId={ID}` — Body 为 `[{partNumber, etag}, ...]`
 4. **中止上传：** `DELETE /_admin/api/multipart/abort?key={文件名}&uploadId={ID}`
@@ -356,9 +443,17 @@ DELETE /_admin/api/delete/{文件名}
 POST /_admin/api/revoke?key={文件名}
 ```
 
+### 如何作废（Invalidate）文件？
+
+作废比吊销更彻底：它将文件标记为 `pending_delete`，链接立即失效，并在下次 Cron 触发时自动物理删除。点击管理后台的 "Invalidate" 按钮或调用：
+
+```
+POST /_admin/api/invalidate?key={文件名}
+```
+
 ### 什么是一次性链接（One-Time Link）？
 
-一次性链接在首次完整下载后会自动吊销，确保链接只能被使用一次。在管理后台点击 "One-Time Link" 按钮即可生成。技术原理：首次访问时后台通过 `waitUntil` 异步更新文件的版本盐值，使该链接的签名立即失效。
+一次性链接在首次完整下载后会自动吊销，确保链接只能被使用一次。在管理后台点击 "One-Time Link" 按钮即可生成。技术原理：首次完整下载时通过 D1 的原子操作递增计数，达到上限后自动更新版本盐值使签名失效。
 
 ### 上传失败怎么办？
 
@@ -375,6 +470,10 @@ let exp = requestedExp || (now + 24 * 60 * 60); // 将 24 * 60 * 60 改为你需
 ### 下载时中文文件名乱码怎么办？
 
 系统已内置 RFC 5987 标准处理，正常情况下不会出现乱码。如果仍有问题，请检查浏览器是否支持 `filename*=UTF-8''` 编码格式。
+
+### 元数据不同步怎么办？
+
+系统内置了自愈（Self-Healing）机制：当文件存在于 R2 但 D1 记录缺失时，Worker 会自动从 R2 的 Custom Metadata 中读取版本盐值、过期时间等信息，重建 D1 记录。一般情况下无需手动干预。
 
 ### 如何查看操作日志？
 
