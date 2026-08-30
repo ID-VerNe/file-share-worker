@@ -4,13 +4,37 @@
 import { sign } from "./crypto.js";
 import { logEvent } from "./logger.js";
 
+/** Paginated R2 bucket size calculation — handles >1000 objects */
+async function getBucketTotalSize(bucket, excludeKey = null) {
+  let totalUsed = 0;
+  let cursor = undefined;
+  let truncated = true;
+  while (truncated) {
+    const opts = cursor ? { cursor } : {};
+    const list = await bucket.list(opts);
+    for (const obj of list.objects) {
+      if (obj.key !== excludeKey) totalUsed += obj.size;
+    }
+    truncated = list.truncated;
+    cursor = list.cursor;
+  }
+  return totalUsed;
+}
+
 export async function handleAdminRequest(request, env, url, isAdmin) {
-  if (!isAdmin) return new Response("Forbidden: Admin Only", { status: 403 });
+  const userEmail = request.headers.get("CF-Access-Authenticated-User-Email") || "unknown";
+  
+  if (!isAdmin) {
+    return Response.json({ 
+      error: "Forbidden: Admin Only"
+    }, { status: 403 });
+  }
 
-  const userEmail = request.headers.get("CF-Access-Authenticated-User-Email") || "admin";
+  const jwt = request.headers.get("CF-Access-JWT-Assertion") || "";
 
-  if (url.pathname === "/_admin") {
-    return renderDashboard(env);
+  // Robust path matching for admin dashboard
+  if (url.pathname === "/_admin" || url.pathname === "/_admin/") {
+    return renderDashboard(env, jwt, url);
   }
 
   if (url.pathname.startsWith("/_admin/api/")) {
@@ -89,20 +113,15 @@ export async function handleAdminRequest(request, env, url, isAdmin) {
       });
     }
 
-    // New: Revoke API
+    // New: Revoke API — invalidate signatures by rotating version_salt in D1
     if (action === "revoke" && request.method === "POST") {
       const key = url.searchParams.get("key");
       if (!key) return new Response("Key required", { status: 400 });
       
       const newVersion = Date.now().toString();
-      const head = await env.BUCKET.head(key);
-      if (!head) return new Response("Not Found", { status: 404 });
-
-      // Use copyObject to update metadata
-      await env.BUCKET.put(key, head.body, {
-        customMetadata: { ...head.customMetadata, v: newVersion },
-        httpMetadata: head.httpMetadata
-      });
+      await env.file_share_db.prepare(
+        "UPDATE files SET version_salt = ? WHERE file_key = ? AND status = 'active'"
+      ).bind(newVersion, key).run();
 
       logEvent(env, { action: "REVOKE", key, email: userEmail });
       return new Response("Revoked");
@@ -136,15 +155,11 @@ async function handleMultipartUpload(request, env, url, userEmail) {
       }
 
       const fileSize = parseInt(url.searchParams.get("size") || "0");
-      const MAX_SIZE = 5 * 1024 * 1024 * 1024; // 5GB Single File
-      if (fileSize > MAX_SIZE) return new Response(`File too large. Max 5GB.`, { status: 400 });
+      const MAX_SIZE = 8 * 1024 * 1024 * 1024; // 8GB Single File
+      if (fileSize > MAX_SIZE) return new Response(`File too large. Max 8GB.`, { status: 400 });
 
-      // 2. Storage Quota Check
-      const list = await env.BUCKET.list();
-      let totalUsed = 0;
-      for (const obj of list.objects) {
-        totalUsed += obj.size;
-      }
+      // 2. Storage Quota Check (paginated)
+      const totalUsed = await getBucketTotalSize(env.BUCKET);
       
       const quotaBytes = TOTAL_QUOTA_GB * 1024 * 1024 * 1024;
       if (totalUsed + fileSize > quotaBytes) {
@@ -183,12 +198,8 @@ async function handleMultipartUpload(request, env, url, userEmail) {
       const upload = env.BUCKET.resumeMultipartUpload(fileKey, uploadId);
       const parts = await request.json();
       
-      // Final Quota Check before completing (Defense in Depth)
-      const list = await env.BUCKET.list();
-      let totalUsed = 0;
-      for (const obj of list.objects) {
-        if (obj.key !== fileKey) totalUsed += obj.size; // Don't count old version of same file
-      }
+      // Final Quota Check before completing (Defense in Depth, paginated)
+      const totalUsed = await getBucketTotalSize(env.BUCKET, fileKey);
       
       // We don't have the exact final size yet easily, but we can approximate or use the start size.
       // Multipart complete is the point of no return.
@@ -231,7 +242,14 @@ async function handleMultipartUpload(request, env, url, userEmail) {
   }
 }
 
-async function renderDashboard(env) {
+async function renderDashboard(env, jwt, url) {
+  // XSS prevention: escape all user-supplied values before inserting into HTML
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, (m) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[m]));
+  }
+
   const { results: d1Files } = await env.file_share_db.prepare(
     "SELECT * FROM files WHERE status != 'deleted' ORDER BY created_at DESC"
   ).all();
@@ -239,6 +257,7 @@ async function renderDashboard(env) {
   const now = Math.floor(Date.now() / 1000);
   
   const files = d1Files.map(o => {
+    const safeKey = escapeHtml(o.file_key);
     const remains = o.expire_at - now;
     const remainsText = remains > 0 
       ? `${(remains / 3600).toFixed(1)}h` 
@@ -249,27 +268,27 @@ async function renderDashboard(env) {
 
     return `
     <tr>
-      <td>${o.file_key}</td>
+      <td>${safeKey}</td>
       <td>${o.download_count} / ${o.max_downloads >= 999999 ? '∞' : o.max_downloads}</td>
       <td>${remainsText}</td>
-      <td><span style="background:${statusColor}; color:white; padding:2px 6px; border-radius:4px; font-size:0.85em">${o.status}</span></td>
+      <td><span style="background:${statusColor}; color:white; padding:2px 6px; border-radius:4px; font-size:0.85em">${escapeHtml(o.status)}</span></td>
       <td>
-        <button onclick="deleteFile('${o.file_key}')" style="color:red" title="Physical Delete">Delete</button>
-        <button onclick="invalidateFile('${o.file_key}')" style="color:orange" ${isInactive ? 'disabled' : ''} title="Revoke and mark for deletion">Invalidate</button>
-        <button onclick="copyLink('${o.file_key}')" ${isInactive ? 'disabled' : ''}>Copy</button>
-        <button onclick="copyLink('${o.file_key}', true)" style="border-style:dashed" ${isInactive ? 'disabled' : ''}>One-Time</button>
+        <button data-action="delete" data-key="${safeKey}" style="color:red" title="Physical Delete">Delete</button>
+        <button data-action="invalidate" data-key="${safeKey}" style="color:orange" ${isInactive ? 'disabled' : ''} title="Revoke and mark for deletion">Invalidate</button>
+        <button data-action="copy" data-key="${safeKey}" ${isInactive ? 'disabled' : ''}>Copy</button>
+        <button data-action="copy-ot" data-key="${safeKey}" style="border-style:dashed" ${isInactive ? 'disabled' : ''}>One-Time</button>
       </td>
     </tr>
     `;
   }).join("");
 
-  const list = await env.BUCKET.list();
   const FREE_LIMIT = 10 * 1024 * 1024 * 1024; // 10GB
-  let totalUsed = 0;
-  list.objects.forEach(o => totalUsed += o.size);
+  const totalUsed = await getBucketTotalSize(env.BUCKET);
 
   const usedPercent = ((totalUsed / FREE_LIMIT) * 100).toFixed(2);
   const remainingGB = ((FREE_LIMIT - totalUsed) / 1024 / 1024 / 1024).toFixed(2);
+
+  const SHARD_DOMAINS_JS = (env.SHARD_DOMAINS || url.origin).split(',').map(d => `'${d.trim()}'`).join(',');
 
   const html = `
   <!DOCTYPE html>
@@ -310,7 +329,7 @@ async function renderDashboard(env) {
     </div>
 
     <div class="card">
-      <h3 style="margin-top:0">Upload File (Max 5GB)</h3>
+      <h3 style="margin-top:0">Upload File (Max 8GB)</h3>
       <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
         <input type="file" id="fileInput" style="flex: 1">
         <div style="display: flex; flex-direction: column; gap: 2px;">
@@ -332,7 +351,10 @@ async function renderDashboard(env) {
     </div>
 
     <script>
-      const CHUNK_SIZE = 40 * 1024 * 1024; 
+      const AUTH_JWT = '${jwt}';
+      const CHUNK_SIZE = 10 * 1024 * 1024; 
+      const SHARD_DOMAINS = [${SHARD_DOMAINS_JS}];
+
 
       async function startUpload() {
         const file = document.getElementById('fileInput').files[0];
@@ -346,57 +368,125 @@ async function renderDashboard(env) {
         let uploadId = null;
         try {
           const maxDl = document.getElementById('maxDownloads').value;
-          const startRes = await fetch('/_admin/api/multipart/start?key=' + encodeURIComponent(file.name) + '&size=' + file.size + '&max=' + maxDl);
+          const startRes = await fetch('/_admin/api/multipart/start?key=' + encodeURIComponent(file.name) + '&size=' + file.size + '&max=' + maxDl, {
+            headers: { 'CF-Access-JWT-Assertion': AUTH_JWT },
+            credentials: 'include'
+          });
+          
+          if (!startRes.ok) {
+            const errData = await startRes.json().catch(() => ({ error: 'Unknown server error' }));
+            throw new Error(errData.error || errData.details || 'Forbidden');
+          }
+          
           const startData = await startRes.json();
           uploadId = startData.uploadId;
 
           const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-          const uploadedParts = [];
+          const uploadedParts = new Array(totalChunks);
+          let uploadedCount = 0;
+          const CONCURRENCY = 6; // Standard browser limit per domain
 
-          for (let i = 0; i < totalChunks; i++) {
-            const start = i * CHUNK_SIZE;
-            const end = Math.min(file.size, start + CHUNK_SIZE);
-            const chunk = file.slice(start, end);
-            const partNumber = i + 1;
-            status.innerText = 'Uploading: ' + Math.round((i/totalChunks)*100) + '%';
-            const upRes = await fetch('/_admin/api/multipart/upload?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId + '&partNumber=' + partNumber, {
-              method: 'PUT',
-              body: chunk
-            });
-            const partData = await upRes.json();
-            uploadedParts.push(partData);
-            pBar.style.width = Math.round((partNumber / totalChunks) * 100) + '%';
-          }
+          const queue = Array.from({ length: totalChunks }, (_, i) => i);
+          const uploadWorker = async (workerIndex) => {
+            while (queue.length > 0) {
+              const i = queue.shift();
+              if (i === undefined) break;
+
+              const start = i * CHUNK_SIZE;
+              const end = Math.min(file.size, start + CHUNK_SIZE);
+              const chunk = file.slice(start, end);
+              const partNumber = i + 1;
+              
+              // Use current origin if sharding fails, and always include credentials
+              const domain = SHARD_DOMAINS.length > 0 ? SHARD_DOMAINS[partNumber % SHARD_DOMAINS.length] : window.location.origin;
+              
+              try {
+                const upRes = await fetch(domain + '/_admin/api/multipart/upload?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId + '&partNumber=' + partNumber, {
+                  method: 'PUT',
+                  body: chunk,
+                  headers: {
+                    'CF-Access-JWT-Assertion': AUTH_JWT
+                  },
+                  credentials: 'include' // MANDATORY for Cloudflare Access to see the session cookie
+                });
+                
+                if (!upRes.ok) {
+                  const errData = await upRes.json().catch(() => ({ error: 'Part upload failed' }));
+                  const errMsg = errData.error || ('Part ' + partNumber + ' failed: ' + upRes.status);
+                  throw new Error(errMsg);
+                }
+                
+                const partData = await upRes.json();
+                uploadedParts[i] = partData;
+                uploadedCount++;
+                
+                status.innerText = 'Uploading: ' + Math.round((uploadedCount/totalChunks)*100) + '% (' + uploadedCount + '/' + totalChunks + ')';
+                pBar.style.width = Math.round((uploadedCount / totalChunks) * 100) + '%';
+              } catch (err) {
+                console.error(err);
+                // Simple retry logic: put back in queue
+                queue.push(i);
+                status.innerText = 'Retrying part ' + partNumber + '... (' + err.message + ')';
+                await new Promise(r => setTimeout(r, 2000));
+              }
+            }
+          };
+
+          // Run workers in parallel
+          await Promise.all(Array.from({ length: Math.min(CONCURRENCY, totalChunks) }, (_, idx) => uploadWorker(idx)));
 
           status.innerText = 'Finalizing...';
-          await fetch('/_admin/api/multipart/complete?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId, {
+          const completeRes = await fetch('/_admin/api/multipart/complete?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId, {
             method: 'POST',
-            body: JSON.stringify(uploadedParts)
+            body: JSON.stringify(uploadedParts),
+            headers: { 'CF-Access-JWT-Assertion': AUTH_JWT },
+            credentials: 'include'
           });
+          
+          if (!completeRes.ok) {
+            const errData = await completeRes.json().catch(() => ({ error: 'Completion failed' }));
+            throw new Error(errData.error || 'Completion failed');
+          }
+          
           location.reload();
         } catch (e) {
           alert('Upload failed: ' + e.message);
-          if (uploadId) fetch('/_admin/api/multipart/abort?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId, { method: 'DELETE' });
+          if (uploadId) fetch('/_admin/api/multipart/abort?key=' + encodeURIComponent(file.name) + '&uploadId=' + uploadId, { 
+            method: 'DELETE',
+            headers: { 'CF-Access-JWT-Assertion': AUTH_JWT },
+            credentials: 'include'
+          });
         }
       }
 
       async function deleteFile(k) {
         if(confirm('Permanently delete from R2 and D1?')) {
-          await fetch('/_admin/api/delete/' + encodeURIComponent(k), { method: 'DELETE' });
+          await fetch('/_admin/api/delete/' + encodeURIComponent(k), { 
+            method: 'DELETE',
+            headers: { 'CF-Access-JWT-Assertion': AUTH_JWT },
+            credentials: 'include'
+          });
           location.reload();
         }
       }
 
       async function invalidateFile(k) {
         if(confirm('Immediately invalidate all links and schedule for deletion? (Soft Delete)')) {
-          await fetch('/_admin/api/invalidate?key=' + encodeURIComponent(k), { method: 'POST' });
+          await fetch('/_admin/api/invalidate?key=' + encodeURIComponent(k), { 
+            method: 'POST',
+            headers: { 'CF-Access-JWT-Assertion': AUTH_JWT },
+            credentials: 'include'
+          });
           location.reload();
         }
       }
       
       async function copyLink(k, isOneTime = false) {
         try {
-          const res = await fetch('/_admin/api/sign?key=' + encodeURIComponent(k) + (isOneTime ? '&ot=1' : ''));
+          const res = await fetch('/_admin/api/sign?key=' + encodeURIComponent(k) + (isOneTime ? '&ot=1' : ''), {
+            headers: { 'CF-Access-JWT-Assertion': AUTH_JWT },
+            credentials: 'include'
+          });
           const data = await res.json();
           if (data.url) {
             navigator.clipboard.writeText(data.url);
@@ -404,6 +494,18 @@ async function renderDashboard(env) {
           } else { throw new Error('No URL'); }
         } catch (e) { alert('Error: ' + e.message); }
       }
+
+      // Event delegation: handle data-action buttons safely (XSS-proof)
+      document.querySelector('tbody').addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-action]');
+        if (!btn || btn.disabled) return;
+        const key = btn.dataset.key;
+        const action = btn.dataset.action;
+        if (action === 'delete') deleteFile(key);
+        else if (action === 'invalidate') invalidateFile(key);
+        else if (action === 'copy') copyLink(key);
+        else if (action === 'copy-ot') copyLink(key, true);
+      });
     </script>
   </body>
   </html>

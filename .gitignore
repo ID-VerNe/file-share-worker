@@ -170,3 +170,8 @@ dist
 *.png
 !public/favicon.png
 
+# Sensitive test scripts with hardcoded credentials
+test-s3-upload.js
+
+# Large binary files
+*.mp4

@@ -18,7 +18,7 @@
 	"r2_buckets": [
 		{
 			"binding": "BUCKET",
-			"bucket_name": "share"
+			"bucket_name": "share-apac"
 		}
 	],
 	/*
@@ -46,7 +46,10 @@
 	 * Note: Use secrets to store sensitive data.
 	 * https://developers.cloudflare.com/workers/configuration/secrets/
 	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
+	"vars": {
+		"SHARD_DOMAINS": "https://share.yuuverne.site",
+		"ADMIN_EMAILS": "yuu_seeing@foxmail.com"
+	},
 	/**
 	 * Static Assets
 	 * https://developers.cloudflare.com/workers/static-assets/binding/

@@ -4,8 +4,7 @@
 
 export async function getFile(env, key, request) {
   if (!key) {
-    const list = await env.BUCKET.list();
-    return Response.json(list.objects);
+    return new Response("Bad Request: Missing file key", { status: 400 });
   }
   
   const rangeHeader = request.headers.get("Range");
@@ -30,7 +29,8 @@ export async function getFile(env, key, request) {
     .replace(/\)/g, "%29")
     .replace(/\*/g, "%2A");
     
-  headers.set("Content-Disposition", `attachment; filename="${key}"; filename*=UTF-8''${encodedKey}`);
+  const safeFilename = key.replace(/"/g, '\\"');
+  headers.set("Content-Disposition", `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedKey}`);
   
   const status = object.body ? (rangeHeader ? 206 : 200) : 304;
   return new Response(object.body, { 

@@ -26,44 +26,69 @@ export default {
 	},
 
 	async fetch(request, env, ctx) {
+		const url = new URL(request.url);
+		const requestOrigin = request.headers.get("Origin");
+		const allowedOrigins = (env.SHARD_DOMAINS || "").split(",").map(d => d.trim()).filter(Boolean);
+		const isAllowedOrigin = requestOrigin && allowedOrigins.includes(requestOrigin);
+		
+		// Helper to add CORS to any response — only whitelisted origins
+		const corsify = (res) => {
+			const newRes = new Response(res.body, res);
+			if (isAllowedOrigin) {
+				newRes.headers.set("Access-Control-Allow-Origin", requestOrigin);
+				newRes.headers.set("Access-Control-Allow-Credentials", "true");
+			}
+			newRes.headers.set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS");
+			newRes.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, CF-Access-JWT-Assertion, Range");
+			newRes.headers.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, CF-Cache-Status");
+			newRes.headers.set("Vary", "Origin");
+			return newRes;
+		};
+
 		try {
-			const url = new URL(request.url);
-			const origin = request.headers.get("Origin") || "*";
-			
 			if (request.method === "OPTIONS") {
-				return new Response(null, {
-					headers: {
-						"Access-Control-Allow-Origin": origin,
-						"Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS",
-						"Access-Control-Allow-Headers": "Content-Type, CF-Access-Authenticated-User-Email, Range",
-						"Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
-						"Access-Control-Max-Age": "86400",
-						"Vary": "Origin"
-					},
-				});
+				const headers = {
+					"Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS",
+					"Access-Control-Allow-Headers": "Content-Type, Authorization, CF-Access-JWT-Assertion, Range",
+					"Access-Control-Expose-Headers": "Content-Length, Content-Range, CF-Cache-Status",
+					"Access-Control-Max-Age": "86400",
+					"Vary": "Origin"
+				};
+				if (isAllowedOrigin) {
+					headers["Access-Control-Allow-Origin"] = requestOrigin;
+					headers["Access-Control-Allow-Credentials"] = "true";
+				}
+				return new Response(null, { headers });
 			}
 
 			if (url.hostname.endsWith(".workers.dev") && !url.hostname.includes("localhost")) {
-				return new Response("Forbidden: Direct access to workers.dev is disabled for security.", { status: 403 });
+				return corsify(new Response("Forbidden: Direct access to workers.dev is disabled for security.", { status: 403 }));
 			}
 
 			if (!env.AUTH_SECRET && !url.hostname.includes("localhost")) {
-				return new Response("Internal Server Error: Missing Security Credentials", { status: 500 });
+				return corsify(new Response("Internal Server Error: Missing Security Credentials", { status: 500 }));
 			}
 
 			const key = decodeURIComponent(url.pathname.slice(1));
 			
 			const jwtAssertion = request.headers.get("CF-Access-JWT-Assertion");
 			const userEmail = request.headers.get("CF-Access-Authenticated-User-Email");
-			const adminEmails = (env.ADMIN_EMAILS || "").split(",").map(e => e.trim());
-			const isAdmin = !!(jwtAssertion && userEmail && adminEmails.includes(userEmail));
+			const adminEmails = (env.ADMIN_EMAILS || "").split(",").map(e => e.trim()).filter(e => e !== "");
+			
+			// isAdmin check: 
+			// 1. Must have an email from Cloudflare Access
+			// 2. That email must be in the whitelist
+			// 3. Or if in development (localhost), allow if any email is present
+			const isLocal = url.hostname.includes("localhost");
+			const isAdmin = !!(userEmail && (adminEmails.includes(userEmail) || isLocal));
 
 			if (url.pathname.startsWith("/_admin")) {
-				return await handleAdminRequest(request, env, url, isAdmin);
+				const res = await handleAdminRequest(request, env, url, isAdmin);
+				return corsify(res);
 			} 
 			
 			if (request.method !== "GET") {
-				return new Response("Method Not Allowed", { status: 405 });
+				return corsify(new Response("Method Not Allowed", { status: 405 }));
 			}
 
 			const signature = url.searchParams.get("s");
@@ -103,7 +128,7 @@ export default {
 				}
 
 				if (!file || file.status !== 'active') {
-					return new Response(`
+					return corsify(new Response(`
 					<!DOCTYPE html>
 					<html>
 					<head>
@@ -124,19 +149,18 @@ export default {
 							<div class="contact">Link Expired or Limit Reached.</div>
 						</div>
 					</body>
-					</html>`, { status: 403, headers: { "Content-Type": "text/html;charset=UTF-8" } });
+					</html>`, { status: 403, headers: { "Content-Type": "text/html;charset=UTF-8" } }));
 				}
 			}
 
 			// 2. Verify signature
 			const isValid = await verify(key, exp, signature, env.AUTH_SECRET || env.GET_SIGNATURE, kid, file.version_salt, ot);
-			if (!isValid) return new Response("Forbidden: Invalid or expired signature", { status: 403 });
+			if (!isValid) return corsify(new Response("Forbidden: Invalid or expired signature", { status: 403 }));
 
-			// --- Atomic Pre-Download Counting ---
+			// --- Atomic Pre-Download Counting (count ALL requests, not just full downloads) ---
 			const range = request.headers.get("Range");
-			const isFullDownload = !range || range.startsWith("bytes=0-");
 
-			if (isFullDownload) {
+			{
 				const result = await env.file_share_db.prepare(`
 					UPDATE files 
 					SET download_count = download_count + 1 
@@ -145,7 +169,7 @@ export default {
 				`).bind(key).first();
 
 				if (!result) {
-					return new Response(`
+					return corsify(new Response(`
 					<!DOCTYPE html>
 					<html>
 					<head>
@@ -164,7 +188,7 @@ export default {
 							<p>下载次数已达上限。<br>Limit reached.</p>
 						</div>
 					</body>
-					</html>`, { status: 403, headers: { "Content-Type": "text/html;charset=UTF-8" } });
+					</html>`, { status: 403, headers: { "Content-Type": "text/html;charset=UTF-8" } }));
 				}
 
 				if (result.download_count >= result.max_downloads || result.is_one_time === 1) {
@@ -182,17 +206,17 @@ export default {
 
 			if (response.status === 404) {
 				ctx.waitUntil(env.file_share_db.prepare("UPDATE files SET status = 'deleted' WHERE file_key = ?").bind(key).run());
-				return new Response("Forbidden: Resource missing", { status: 403 });
+				return corsify(new Response("Forbidden: Resource missing", { status: 403 }));
 			}
 
 			const finalHeaders = new Headers(response.headers);
 			finalHeaders.set("X-Robots-Tag", "noindex, nofollow");
 			finalHeaders.set("X-Content-Type-Options", "nosniff");
-			finalHeaders.set("Access-Control-Allow-Origin", origin);
-			finalHeaders.set("Vary", "Origin");
+			finalHeaders.set("X-Frame-Options", "DENY");
+			finalHeaders.set("Referrer-Policy", "no-referrer");
+			finalHeaders.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
 			
 			// --- NEW: Kill Caching to force counting ---
-			// We must ensure the browser doesn't serve from local cache, otherwise counting is bypassed.
 			finalHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0");
 			finalHeaders.set("Pragma", "no-cache");
 			finalHeaders.set("Expires", "0");
@@ -205,18 +229,18 @@ export default {
 				});
 			}
 
-			return new Response(response.body, {
+			return corsify(new Response(response.body, {
 				status: response.status,
 				statusText: response.statusText,
 				headers: finalHeaders
-			});
+			}));
 
 		} catch (e) {
 			console.error("Worker Error:", e);
-			return new Response(`Error: 500 | Internal Server Error\n${e.message}\n${e.stack}`, { 
+			return corsify(new Response("Error: 500 | Internal Server Error", { 
 				status: 500,
 				headers: { "Content-Type": "text/plain;charset=UTF-8" }
-			});
+			}));
 		}
 	},
 };
