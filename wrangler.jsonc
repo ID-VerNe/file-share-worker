@@ -47,8 +47,7 @@
 	 * https://developers.cloudflare.com/workers/configuration/secrets/
 	 */
 	"vars": {
-		"SHARD_DOMAINS": "https://share.yuuverne.site",
-		"ADMIN_EMAILS": "yuu_seeing@foxmail.com"
+		"SHARD_DOMAINS": "https://share.yuuverne.site"
 	},
 	/**
 	 * Static Assets
@@ -66,7 +65,8 @@
 	],
 	"triggers": {
 		"crons": [
-			"*/30 * * * *"
+			"*/30 * * * *",
+			"0 * * * *"
 		]
 	}
 	/**

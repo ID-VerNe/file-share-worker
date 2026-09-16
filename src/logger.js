@@ -2,7 +2,7 @@
  * Logging and Analytics utility
  */
 
-export function logEvent(env, { action, key, email = "public", status = 200, size = 0, ot = false }) {
+export function logEvent(env, { action, key, email = "public", status = 200, size = 0, ot = false, count = 0 }) {
   const timestamp = new Date().toISOString();
   
   // Desensitize email: yuu_seeing@foxmail.com -> y***g@foxmail.com
@@ -23,7 +23,8 @@ export function logEvent(env, { action, key, email = "public", status = 200, siz
     email: maskedEmail,
     status,
     size,
-    ot
+    ot,
+    count
   };
 
   // 1. Structured Console Logging (visible in Cloudflare Dashboard)

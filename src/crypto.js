@@ -15,33 +15,39 @@ export async function sign(key, exp, secretMap, kid = "v1", salt = "", ot = "0")
     ["sign"]
   );
   const sig = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(data));
-  return btoa(String.fromCharCode(...new Uint8Array(sig)))
+  return toBase64(new Uint8Array(sig))
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=/g, "");
 }
 
 export async function verify(key, exp, signature, secretMap, kid = "v1", salt = "", ot = "0") {
-  // 1. Check if signature and exp are present
-  if (!signature || !exp) {
-    return false;
-  }
-
-  // 2. Check expiration
+  // Always compute the expected HMAC before deciding, then compare in constant
+  // time. Avoids leaking (via early-return timing) whether the signature is
+  // missing or the link has expired.
   const now = Math.floor(Date.now() / 1000);
-  if (parseInt(exp) < now) {
-    return false;
-  }
+  const expInt = parseInt(exp);
+  const expired = !(Number.isInteger(expInt) && expInt >= now);
 
-  // 3. Generate expected signature
+  let expectedSignature = "";
   try {
-    const expectedSignature = await sign(key, exp, secretMap, kid, salt, ot);
-    // 4. Constant-time comparison
-    return safeCompare(signature, expectedSignature);
+    expectedSignature = await sign(key, exp, secretMap, kid, salt, ot);
   } catch (e) {
     console.error(`Verification error: ${e.message}`);
     return false;
   }
+
+  return !expired && safeCompare(signature || "", expectedSignature);
+}
+
+function toBase64(bytes) {
+  // Chunked base64: avoids the call-stack limit of spreading large buffers.
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
 }
 
 function getSecret(secretMap, kid) {

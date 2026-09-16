@@ -24,7 +24,7 @@
 1. **动态签名保护：** 每个分享链接均根据文件名、过期时间、文件版本盐值和一次性标记动态生成 HMAC-SHA256 签名，防止横向越权访问。
 2. **链接时效性：** 支持设置链接有效期（默认 24 小时，最长 30 天），过期自动失效。
 3. **一次性链接（One-Time Link）：** 支持生成仅可访问一次的下载链接，首次完整下载后自动吊销，适合发送敏感文件。
-4. **下载次数限制：** 上传时可设置最大下载次数，达到上限后链接自动失效。
+4. **下载次数限制：** 上传时可设置最大下载次数，达到上限后链接自动失效。计数按"完整下载"计：流式播放器的 Range 请求不消耗额度，只有覆盖到文件末字节的下载（200 全量或末段 206）才 +1。
 5. **链接吊销（Revoke）：** 支持一键吊销某个文件的所有已签发链接，通过更新文件元数据中的版本盐值使旧签名立即失效，无需删除文件。
 6. **链接作废（Invalidate）：** 支持将文件标记为"待删除"状态，立即失效所有链接，并在下次 Cron 触发时自动从 R2 中物理删除。
 7. **多密钥轮转支持：** 签名支持 `kid`（Key ID）参数，可在 `AUTH_SECRET` 中以 JSON 形式配置多个密钥，实现平滑密钥轮换。
@@ -32,7 +32,7 @@
 9. **存储配额管理：** 可配置总存储上限（默认 10GB），上传前自动校验，超限拒绝上传。
 10. **文件类型白名单：** 仅允许上传指定扩展名的文件类型，防止恶意文件上传。
 11. **完美中文支持：** 严格遵循 RFC 5987 标准（`filename*=UTF-8''`），彻底解决下载时中文文件名乱码问题。
-12. **原子下载计数：** 基于 D1 数据库的 `RETURNING` 子句实现原子化的下载次数递增，精确控制下载限额。
+12. **原子下载计数：** 基于 D1 数据库的 `RETURNING` 子句实现原子化的下载次数递增，仅在完整下载时计数，精确控制下载限额。
 13. **元数据自愈（Self-Healing）：** 当文件存在于 R2 但 D1 元数据记录缺失时，自动从 R2 的 Custom Metadata 重建 D1 记录，保证系统一致性。
 14. **惰性清理（Lazy Cleanup）：** 访问过期文件时即时删除并返回失效页面，Cron 定时任务做兜底批量清理。
 15. **美观的失效页面：** 链接过期或达到下载上限时，返回友好的中文/双语失效提示页面。
@@ -60,13 +60,20 @@ CREATE TABLE IF NOT EXISTS files (
   download_count INTEGER DEFAULT 0,       -- 当前下载次数
   version_salt   TEXT NOT NULL,           -- 版本盐值（用于签名和吊销）
   is_one_time    INTEGER DEFAULT 0,       -- 是否一次性链接
-  status         TEXT DEFAULT 'active',   -- active / pending_delete / deleted / expired
+  status         TEXT DEFAULT 'active',   -- active / pending_delete / deleted (expired 仅在请求处理时作为内存瞬态，不落库)
   created_at     INTEGER NOT NULL,        -- 创建时间戳
   delete_after   INTEGER                  -- 待删除时间戳（pending_delete 状态用）
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_expire ON files(expire_at);
+```
+
+> 额外建一个 `meta` 表维护 `used_bytes` 配额计数器（见 `migrations/0002_create_meta_table.sql`），后台打开与上传检查只读单行，不再每次全桶 `list`：
+
+```sql
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+INSERT OR IGNORE INTO meta (k, v) VALUES ('used_bytes', '0');
 ```
 
 ---
@@ -120,6 +127,7 @@ flowchart TD
 | `/_admin/api/revoke` | POST | Cloudflare Access | 吊销文件所有已签发链接 |
 | `/_admin/api/invalidate` | POST | Cloudflare Access | 作废链接并标记待删除 |
 | `/_admin/api/delete/*` | DELETE | Cloudflare Access | 物理删除文件 |
+| `/_admin/api/reconcile` | POST | Cloudflare Access | 全桶扫描校准 used_bytes 配额计数器 |
 | `/_admin/api/multipart/start` | GET | Cloudflare Access | 初始化分片上传 |
 | `/_admin/api/multipart/upload` | PUT | Cloudflare Access | 上传分片 |
 | `/_admin/api/multipart/complete` | POST | Cloudflare Access | 完成分片上传 |
@@ -219,11 +227,15 @@ npx wrangler secret put AUTH_SECRET
 openssl rand -base64 32
 ```
 
-### 5. 配置管理员邮箱
+### 5. 配置管理员邮箱与 Access 验证
 
 ```bash
 # 设置管理员邮箱列表，多个邮箱用逗号分隔
 npx wrangler secret put ADMIN_EMAILS
+# 设置 Cloudflare Access 团队域名（形如 https://<team>.cloudflareaccess.com）
+npx wrangler secret put TEAM_DOMAIN
+# 设置 Access 应用 Audience Tag（Zero Trust -> Access -> Applications -> 你的应用 -> Additional settings -> Application Audience (AUD) Tag）
+npx wrangler secret put POLICY_AUD
 ```
 
 输入格式：`admin@example.com,admin2@example.com`
@@ -248,7 +260,8 @@ pnpm run deploy
 |--------|------|------|--------|------|
 | `AUTH_SECRET` | Secret | 生产环境必填 | - | HMAC 签名密钥。支持两种格式：<br>• 纯字符串：作为 `kid=v1` 的密钥<br>• JSON 对象：`{"v1":"密钥1","v2":"密钥2"}` 支持多密钥轮转 |
 | `ADMIN_EMAILS` | Secret | 是 | - | 管理员邮箱列表，支持多个邮箱用逗号分隔（如 `a@b.com,c@d.com`） |
-| `GET_SIGNATURE` | Secret | 否 | - | 兼容旧版，若未设置 `AUTH_SECRET` 则回退使用此变量 |
+| `TEAM_DOMAIN` | Secret | 是 | - | Cloudflare Access 团队域名，形如 `https://<team>.cloudflareaccess.com`，用于验证 `CF-Access-JWT-Assertion` |
+| `POLICY_AUD` | Secret | 是 | - | Cloudflare Access 应用的 Audience Tag，用于 JWT `aud` 校验 |
 | `TOTAL_QUOTA_GB` | Var | 否 | `10` | 存储总配额（GB），超出后拒绝上传 |
 
 ---
@@ -263,14 +276,18 @@ pnpm run deploy
 2. 创建 Self-hosted 应用，Application Domain 填写你的自定义域名
 3. Path 设置为 `/_admin*`
 4. 在 Policy 中配置仅允许管理员邮箱访问
+5. 复制该应用的 Application Audience (AUD) Tag，填入 `POLICY_AUD` secret
 
-### 2. 管理员邮箱配置
+**重要：每个 shard 域名都要单独配置 Access。** 分片上传走 `SHARD_DOMAINS` 里的一组域名，这些是不同于主域的另一组域名，Worker 在它们上同样靠 Access 鉴权。如果任一 shard 域名没有自己的 Access 策略，该域名上的 `/_admin*` 就不会经过 Access，鉴权依赖就会崩塌。为每个 shard 域名重复上面的 1-5 步。
 
-管理员邮箱通过环境变量 `ADMIN_EMAILS` 管理，系统会自动校验 `CF-Access-Authenticated-User-Email` 请求头是否在白名单中。
+### 2. 管理员邮箱与 JWT 验证
+
+管理员邮箱通过 secret `ADMIN_EMAILS` 管理。生产环境下，Worker 用 `TEAM_DOMAIN`+`POLICY_AUD` 验证 `CF-Access-JWT-Assertion` 的 RS256 签名与 `aud`/`iss`/`exp`，从验证后的 JWT 取 `email` 比对白名单——不再裸信 `CF-Access-Authenticated-User-Email` 头（该头在未过 Access 的域名上可被伪造）。
 
 ```bash
-npx wrangler secret put ADMIN_EMAILS
-# 输入: user1@example.com,user2@example.com
+npx wrangler secret put ADMIN_EMAILS    # 输入: user1@example.com,user2@example.com
+npx wrangler secret put TEAM_DOMAIN    # 输入: https://<team>.cloudflareaccess.com
+npx wrangler secret put POLICY_AUD     # 输入: <Access app AUD tag>
 ```
 
 ### 3. 自定义域名绑定
@@ -396,7 +413,7 @@ GET /_admin/api/sign?key={文件名}&exp={过期时间戳}&k={密钥ID}&ot={是�
 POST /_admin/api/revoke?key={文件名}
 ```
 
-使指定文件的所有已签发链接立即失效。通过更新 R2 文件的 Custom Metadata 版本盐值实现，无需删除文件。
+使指定文件的所有已签发链接立即失效。通过更新 D1 记录中的版本盐值（`version_salt`）实现，使旧签名立即失效，无需删除文件。注意：版本盐值只存于 D1，不回写 R2 Custom Metadata。
 
 ### 作废链接
 
@@ -437,7 +454,7 @@ DELETE /_admin/api/delete/{文件名}
 
 ### 如何吊销某个文件的分享链接？
 
-在管理后台点击文件对应的 "Revoke Links" 按钮，系统会更新文件的版本盐值，使所有旧签名立即失效。也可以调用 API：
+在管理后台点击文件对应的 "Revoke Links" 按钮，系统会更新 D1 记录中的版本盐值，使所有旧签名立即失效（不回写 R2 Custom Metadata）。也可以调用 API：
 
 ```
 POST /_admin/api/revoke?key={文件名}
@@ -453,7 +470,7 @@ POST /_admin/api/invalidate?key={文件名}
 
 ### 什么是一次性链接（One-Time Link）？
 
-一次性链接在首次完整下载后会自动吊销，确保链接只能被使用一次。在管理后台点击 "One-Time Link" 按钮即可生成。技术原理：首次完整下载时通过 D1 的原子操作递增计数，达到上限后自动更新版本盐值使签名失效。
+一次性链接在首次完整下载（覆盖到文件末字节的 200 或 206 请求）后会自动吊销，确保链接只能被使用一次。在管理后台点击 "One-Time Link" 按钮即可生成。技术原理：sign 接口在 `ot=1` 时把 D1 的 `is_one_time=1`；首次完整下载时计数 +1 达到上限，触发自动吊销（轮换版本盐值）。流式播放器的 Range 请求不消耗额度，只有完整下载才计数。
 
 ### 上传失败怎么办？
 
